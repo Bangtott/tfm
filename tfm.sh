@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 CONFIG_FILE="/etc/traffic-firewall-manager.conf"
 UPDATE_SCRIPT="/usr/local/sbin/tfm-update-blocklists"
 APPLY_SCRIPT="/usr/local/sbin/tfm-apply"
@@ -106,10 +106,43 @@ parse_ports() {
   done
 }
 
+read_custom_tcp_rules() {
+  local target port resolved rule
+  CUSTOM_TCP_RULES=()
+  while ask_yes_no "Добавить правило IPv4/домен → отдельный TCP-порт?" n; do
+    while true; do
+      read -r -p '  IPv4 или домен: ' target
+      if ! is_ipv4 "$target" && ! is_domain "$target"; then
+        warn "Некорректный IPv4 или домен: $target"
+        continue
+      fi
+      resolved=$(resolve_ipv4_target "$target")
+      [[ -n $resolved ]] || { warn "Не удалось получить IPv4 для $target"; continue; }
+      break
+    done
+    while true; do
+      read -r -p '  TCP-порт (например 48536): ' port
+      is_port "$port" || { warn "Некорректный TCP-порт: $port"; continue; }
+      port=$((10#$port))
+      case $port in
+        22|80|443|2222|8443) warn "Порт $port настраивается отдельным шагом"; continue ;;
+      esac
+      if [[ " ${PARSED_PORTS[*]-} " == *" $port "* ]]; then
+        warn "Порт $port уже открыт для всех в списке дополнительных портов"
+        continue
+      fi
+      break
+    done
+    rule="$target|$port"
+    [[ " ${CUSTOM_TCP_RULES[*]-} " == *" $rule "* ]] || CUSTOM_TCP_RULES+=("$rule")
+    printf '  Добавлено: %s -> %s/tcp\n' "$target" "$port"
+  done
+}
+
 write_config() {
   local targets=$1 enable_8443=$2 enable_http_80=$3 enable_tg=$4 enable_asn=$5 enable_grchc=$6
   shift 6
-  local extra_ports=$1
+  local extra_ports=$1 custom_rules=$2
   install -d -m 0755 "$(dirname "$CONFIG_FILE")"
   {
     printf '# Managed by traffic-firewall-manager %s\n' "$VERSION"
@@ -120,6 +153,7 @@ write_config() {
     printf 'ENABLE_ASN_BLOCK=%q\n' "$enable_asn"
     printf 'ENABLE_GRCHC_BLOCK=%q\n' "$enable_grchc"
     printf 'EXTRA_TCP_PORTS=(%s)\n' "$extra_ports"
+    printf 'CUSTOM_TCP_RULES=(%s)\n' "$custom_rules"
 
   } > "$CONFIG_FILE"
   chmod 0600 "$CONFIG_FILE"
@@ -289,6 +323,21 @@ if ((${#RESOLVED_2222_IPS[@]} == 0)); then
   exit 1
 fi
 
+RESOLVED_CUSTOM_TCP_RULES=()
+for rule in "${CUSTOM_TCP_RULES[@]-}"; do
+  [[ -n $rule ]] || continue
+  target=${rule%%|*}
+  port=${rule##*|}
+  mapfile -t resolved_ips < <(getent ahostsv4 "$target" 2>/dev/null | awk '{print $1}' | sort -u)
+  if ((${#resolved_ips[@]} == 0)); then
+    echo "ERROR: не удалось получить IPv4 для пользовательского правила $target -> $port/tcp" >&2
+    exit 1
+  fi
+  for ip in "${resolved_ips[@]}"; do
+    RESOLVED_CUSTOM_TCP_RULES+=("$ip|$port")
+  done
+done
+
 ipt_delete_all() {
   local chain=$1 target=$2
   while iptables -w -C "$chain" -j "$target" 2>/dev/null; do
@@ -323,6 +372,11 @@ else
 fi
 for port in "${EXTRA_TCP_PORTS[@]}"; do
   iptables -w -A TFM-ACCESS -p tcp --dport "$port" -j ACCEPT
+done
+for rule in "${RESOLVED_CUSTOM_TCP_RULES[@]}"; do
+  ip=${rule%%|*}
+  port=${rule##*|}
+  iptables -w -A TFM-ACCESS -p tcp -s "$ip" --dport "$port" -m conntrack --ctstate NEW -j ACCEPT
 done
 for ip in "${RESOLVED_2222_IPS[@]}"; do
   iptables -w -A TFM-ACCESS -p tcp -s "$ip" --dport 2222 -m conntrack --ctstate NEW -j ACCEPT
@@ -492,7 +546,7 @@ reset_firewall() {
 }
 
 wizard() {
-  local enable_8443=0 enable_http_80=0 enable_tg=0 enable_asn=0 enable_grchc=0 raw targets_q
+  local enable_8443=0 enable_http_80=0 enable_tg=0 enable_asn=0 enable_grchc=0 raw targets_q custom_rules_q=""
 
   printf 'Traffic Firewall Manager %s\n' "$VERSION"
   printf 'Разрешаются только выбранные входящие порты; весь остальной входящий трафик блокируется.\n'
@@ -510,6 +564,9 @@ wizard() {
   local extra_ports_q=""
   if ((${#PARSED_PORTS[@]})); then printf -v extra_ports_q '%q ' "${PARSED_PORTS[@]}"; fi
 
+  read_custom_tcp_rules
+  if ((${#CUSTOM_TCP_RULES[@]})); then printf -v custom_rules_q '%q ' "${CUSTOM_TCP_RULES[@]}"; fi
+
   ask_yes_no "Установить/обновить Traffic Guard? (блокировка на всех портах)" y && enable_tg=1
   ask_yes_no "Включить Leaseweb & HE? (блокировка на всех портах)" y && enable_asn=1
   ask_yes_no "Включить блокировку ГРЧЦ? (на всех портах)" y && enable_grchc=1
@@ -520,12 +577,15 @@ wizard() {
   [[ $enable_http_80 == 1 ]] && printf '  80/tcp: открыт для всех\n' || printf '  80/tcp: закрыт\n'
   [[ $enable_8443 == 1 ]] && printf '  8443/tcp: открыт для всех\n' || printf '  8443/tcp: закрыт\n'
   [[ -n $extra_ports_q ]] && printf '  Дополнительные TCP-порты: открыты для всех\n'
+  for rule in "${CUSTOM_TCP_RULES[@]}"; do
+    printf '  Пользовательское правило: %s -> %s/tcp\n' "${rule%%|*}" "${rule##*|}"
+  done
   printf '  Traffic Guard: %s; Leaseweb/HE: %s; ГРЧЦ: %s\n' "$enable_tg" "$enable_asn" "$enable_grchc"
   ask_yes_no "Продолжить?" y || exit 0
 
   # Конфиг с allow-правилами создаётся до любых операций с firewall.
   write_config "$targets_q" "$enable_8443" "$enable_http_80" "$enable_tg" "$enable_asn" "$enable_grchc" \
-    "$extra_ports_q"
+    "$extra_ports_q" "$custom_rules_q"
 
   install_dependencies
   install_safety_rules "${PARSED_2222_TARGETS[@]}"
